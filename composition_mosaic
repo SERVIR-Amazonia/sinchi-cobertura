@@ -1,0 +1,266 @@
+/**
+ *Este script es desarrollado en  JavaScript para ser ejecutado en Google Earth Engine.  
+ *Genera un mosaico con una composición de productos derivados de imágenes Sentinel-2 , eliminando nubes y sombras, y luego calculando NDVI y EVI para las áreas de interés. A continuación, se desglosa cada parte del código:
+ *El script procesa imágenes de Sentinel-2 del área de la Amazonía Colombiana durante un  *período específico. (Ej. Una imagen por semestre)
+ *Primero combina datos de Reflectancia Superficial (SR) de Sentinel-2 con un modelo de probabilidad de nubes. 
+ *Luego aplica máscaras para remover nubes y sus sombras y calcula dos índices de vegetación: NDVI y EVI.
+ *La salida es una imagen donde, para cada banda (r,g,b) y para cada píxel, se obtiene el percentil 50 de los valores que toma el píxel durante todo el periodo estudiado
+ *El Script acá presentado se basa en el script desarrollado por Kyle Woodward para Python (https://github.com/kyle-woodward)
+**/
+
+
+//Definir variables
+var CLOUD_FILTER = 70; //Se usará para filtrar imágenes donde más del 70% de los píxeles estén cubiertos por nubes.
+
+var CLD_PRB_THRESH = 40; //Define el umbral de probabilidad de nubes para clasificar píxeles como nube o no nube basado en el modelo s2cloudless. 
+                         //Establece un umbral de probabilidad para determinar si un píxel se clasifica como nube o no, según el modelo s2cloudless. 
+                         //Es decir, cualquier píxel que tenga una probabilidad superior al 40% de ser una nube se clasificará como tal.
+
+var NIR_DRK_THRESH = 0.15; //Umbral para identificar píxeles oscuros en la banda NIR que no son agua (banda B8). 
+                           //Estos píxeles oscuros que no son agua son potencialmente sombras de nubes. 
+                           //Si un píxel tiene un valor menor que 0.15 en esta banda, es posible que esté indicando la sombra de una nube.
+                          
+
+var CLD_PRJ_DIST = 2; //Distancia máxima (km) para buscar sombras de nubes desde los bordes de las nubes.
+
+var BUFFER = 10;    //Distancia (m) para dilatar el borde de los objetos identificados como nubes
+
+var SR_BAND_SCALE = 1e4; //Almacena el valor 1e4 (10,000). 
+
+var model_inputs = {
+    'percentileOptions': [50],// opciones de percentil,en este caso solo se incluye el percentil 50
+    };
+
+// Fechas para generar el mosaico
+var start_year = 2022;
+var start_month = 1;
+var start_day = 1;
+var end_year = 2022;
+var end_month = 6;
+var end_day = 30;
+
+// Generar fecha completa
+var start_date = ee.Date.fromYMD(start_year, start_month, start_day);
+var end_date = ee.Date.fromYMD(end_year, end_month, end_day);
+
+
+// AOI Amazonia Colombiana
+/*
+var aoi = geometry; //Define aoi piloto dentro de Amazonia Colombiana para probar el código
+*/
+
+//AOI Amazonia Colombiana
+var aoi = Region_100K.first().geometry();//AOI para la amazonía Colombiana
+var region = aoi.buffer(10000);
+/* 
+// Visualizar el extent de la Amazonia Colombiana 
+ * Map.addLayer(Region_100K, {}, "Region_100K");
+ * Map.centerObject(Region_100K);
+*/
+
+
+// get_s2_sr_cld_col almacena una colección de imágenes de reflectancia superficial SR de Sentinel-2,
+//Cada imagen está emparejada con datos de probabilidad de nubes.
+var get_s2_sr_cld_col = function(aoi, start_date, end_date) {
+  
+    // s2_sr_col filtra la colección de imágenes SR de Sentinel-2 para el Área de Interés (AOI) y entre las fechas de inicio y fin indicadas.
+    // y excluye imágenes con un porcentaje de píxeles nublados mayor al umbral definido en CLOUD_FILTER
+    var s2_sr_col = ee.ImageCollection('COPERNICUS/S2_SR')
+        .filterBounds(aoi)
+        .filterDate(start_date, end_date)
+        .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', CLOUD_FILTER));
+    
+    //s2_cloudless_col filtra la colección de imágenes S2_CLOUD_PROBABILITY para el AOI y el rango de fechas.
+    //La colección S2 cloud probability proporciona datos de probabilidad de nubes
+    var s2_cloudless_col = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
+        .filterBounds(aoi)
+        .filterDate(start_date, end_date);
+
+    // Une las colecciones SR y s2cloudless basándose en la propiedad 'system:index', 
+    // lo que garantiza que cada imagen SR se empareje con su correspondiente imagen de probabilidad de nubes.
+    var join = ee.Join.saveFirst('s2cloudless');
+    var filter = ee.Filter.equals({
+        leftField: 'system:index',
+        rightField: 'system:index'
+    });
+    
+    //se aplica la unión entre las dos colecciones de imágenes usando las condiciones definidas anteriormente.
+    //La función devuelve una colección de imágenes que contiene las imágenes SR 
+    //junto con sus correspondientes datos de probabilidad de nubes.
+    return ee.ImageCollection(join.apply({
+        primary: s2_sr_col,
+        secondary: s2_cloudless_col,
+        condition: filter
+    }));
+};
+
+//Agregar bandas que indican la probabilidad de presencia de nubes 
+//y una máscara binaria de nubes a la imagen.
+var add_cloud_bands = function(img) {
+    var cld_prb = ee.Image(img.get('s2cloudless')).select('probability');// Contiene la imagen con la probabilidad de presencia de nubes en una imagen según el modelo s2cloudless. 
+                                                                         //Accede a una imagen que proviene de la colección 's2cloudless'.
+    var is_cloud = cld_prb.gt(CLD_PRB_THRESH).rename('clouds');//Contiene una imagen binaria derivada de la probabilidad de nubosidad dada por 's2cloudless'. 
+                                                               //Evalúa si los valores en la variable cld_prb  son mayores que el umbral definido en CLD_PRB_THRESH. 
+                                                               
+    return img.addBands(ee.Image([cld_prb, is_cloud]));//Devuelve imagen binaria donde píxeles con probabilidad de nubosidad mayor que el umbral tienen un valor de 1 y los otros de 0.
+};
+
+//Agregar bandas de sombras
+//Identifica y proyecta las sombras de las nubes. 
+//Luego, añade esta información como nuevas bandas a la imagen original. 
+//Utiliza el ángulo azimutal del sol y detecta píxeles oscuros que podrían indicar sombras y realiza una proyección de las sombras desde las ubicaciones de las nubes. 
+//Al final, combina la información de píxeles oscuros y las sombras proyectadas.
+var add_shadow_bands = function(img) {
+    var not_water = img.select('SCL').neq(6);//Imagen binaria. Píxeles con valor 1 representan áreas que no son agua (basado en banda 'SCL' o Scene Classification Map)
+                                             //Los píxeles con valor 0 representan áreas de agua. 
+                                             //Específicamente, identifica píxeles de agua desde la banda SCL(Scene Classification Map). 
+                                             //Banda 'SCL' corresponde a clasificación de coberturas (Ver https://custom-scripts.sentinel-hub.com/custom-scripts/sentinel-2/scene-classification/)
+    
+    // dark_pixels es una imagen binaria de píxeles oscuros en B8 que son potenciales sombras de nube y que no son agua. 
+    //Donde 1 indica un píxel oscuro (potencial sombra) y 0 indica lo contrario. 
+    //Es el resultado de:
+    //1- Seleccionar la banda 'B8' (NIR) y verificar qué píxeles tienen un valor inferior a un umbral NIR_DRK_THRESH x SR_BAND_SCALE. Píxeles oscuros en NIR son indicadores de sombras de nubes.
+    //2- Multiplicar la imagen binaria resultante por la imagen not_water para asegurarse de que no está contando áreas cubiertas con agua.
+    var dark_pixels = img.select('B8').lt(NIR_DRK_THRESH * SR_BAND_SCALE).multiply(not_water).rename('dark_pixels');
+    
+    //shadow_azimuth determina la dirección para proyectar la sombra de las nubes 
+    //Se basa en una propiedad de la imagen que indica el ángulo azimutal del sol, y lo resta de 90 grados para obtener la dirección en la que se proyectaría la sombra de una nube.
+    var shadow_azimuth = ee.Number(90).subtract(ee.Number(img.get('MEAN_SOLAR_AZIMUTH_ANGLE')));
+    
+    //cld_proj almacena la proyección de las sombras de las nubes.
+    //Indica la dirección y distancia en la que las nubes proyectarían sombras en el terreno, basándose en el azimut previamente calculado.
+    //Finalmente, renombra el resultado como 'cloud_transform'.
+    var cld_proj = img.select('clouds').directionalDistanceTransform(shadow_azimuth, CLD_PRJ_DIST * 10)
+        .reproject({
+            crs: img.select(0).projection(),
+            scale: 100
+        })
+        .select('distance')
+        .mask()
+        .rename('cloud_transform');
+        
+    //La variable shadows identifica la intersección de los píxeles oscuros con la proyección de sombra de nube cld_proj. 
+    //Es decir, determina dónde es probable que las sombras de las nubes se manifiesten para mejorar su detección
+    var shadows = cld_proj.multiply(dark_pixels).rename('shadows');
+    
+    return img.addBands(ee.Image([dark_pixels, cld_proj, shadows]));//La función retorna una imagen con 3 bandas:
+                                                                    //dark_pixels, cld_proj y shadows
+};
+// add_cld_shdw_mask agrega una máscara de sombras de nubes (cloudmask)como una banda a la imagen de entrada. 
+//Primero se identifican las nubes y luego las sombras que estas nubes podrían proyectar en la imagen. 
+//Estas áreas son combinadas en una única máscara que etiqueta tanto las nubes como sus sombras. 
+//La función finalmente devuelve la imagen original (img) con una banda adicional que contiene esta máscara.
+var add_cld_shdw_mask = function(img) {
+    var img_cloud = add_cloud_bands(img);//Almacena la imagen generada por la función add_cloud_bands. 
+    var img_cloud_shadow = add_shadow_bands(img_cloud);//Almacena la imagen generada por la función addShadowBands usando como entrada la imagen almacenada en img_cloud
+    
+    //En la variable is_cld_shdw inicialmente almacena la imagen que combina las máscaras de nubes y de sombras. 
+    //Si en un píxel hay una nube o una sombra (o ambos), se le asigna el valor 1, de lo contrario, 0. 
+    var is_cld_shdw = img_cloud_shadow.select('clouds').add(img_cloud_shadow.select('shadows')).gt(0);
+    
+    //Se refina la imagen almacenada en is_cld_shdw eliminando pequeños parches de sombras/nubes
+    //dilatando los píxeles restantes por un factor dado por la variable BUFFER. 
+    //focal_min(2) elimina pequeños parches de sombras/nubes reemplazando cada píxel en la imagen por el valor mínimo en su vecindario de 2 píxeles.
+    //La función focal_max(BUFFER * 2 / 20) dilata los píxeles restantes en la imagen por un factor dado por la variable BUFFER. 
+    //Esta dilatación amplía las regiones blancas (valor 1) en una imagen binaria.
+    var is_cld_shdw = is_cld_shdw.focal_min(2).focal_max(BUFFER * 2 / 20) 
+        .reproject({
+          //Función que vuelve a proyectar la imagen a la misma proyección que la primera banda de la imagen original (img)
+          //Usa una escala de 20 para mejorar desempeño
+            crs: img.select([0]).projection(),
+            scale: 20
+        })
+        .rename('cloudmask'); //Renombra esta banda creada como cloudmask.
+    return img.addBands(is_cld_shdw);
+};
+
+//apply_cld_shdw_mask aplica una máscara a las bandas de reflectancia de la imagen para "ocultar" los píxeles bajo nubes o con sombras de nubes. 
+//La función devuelve la imagen con las bandas de reflectancia actualizadas sin nubes ni sombras.
+var apply_cld_shdw_mask = function(img) {
+    var not_cld_shdw = img.select('cloudmask').not();
+    return img.select('B.*').updateMask(not_cld_shdw);
+};
+
+//Estima NDVI y lo agrega como una banda
+var add_ndvi = function(img) {
+  var ndvi = img.normalizedDifference(['nir', 'red']).rename('NDVI');
+    img=img.addBands(ndvi);//Agrega NDVI como una banda
+  var covariates = ["blue", "green", "red", "nir", "swir1", 'swir2', 'NDVI'];
+  img= img.select(covariates);
+  return img;
+}
+
+
+// Estima EVI y lo agrega como una banda
+//Se debe dividir por 10000 porque SR_BAND_SCALE habiamos multiplicado por 10000
+var calculateEVI = function(img) {
+  var evi = img.expression(
+    '2.5 * (((NIR/10000) - (Red/10000)) / ((NIR/10000) + 6 * (Red/10000) - 7.5 * (Blue/10000) + 1))', {
+      'NIR': img.select('nir'),
+      'Red': img.select('red'),
+      'Blue': img.select('blue')
+    });
+  return img.addBands(evi.rename('EVI'));//Agrega imagen con EVI
+};
+
+
+// Ejecutar todas las funciones de procesamiento de las imagenes descritas en getS2SrCldCol 
+// para  el rango de años proporcionado, prefiltrando imágenes con cnubes/sombras.
+var s2process = function(aoi, start_year, end_year) {
+  var start_date = ee.Date.fromYMD(start_year, start_month, start_day);
+  var end_date = ee.Date.fromYMD(end_year, end_month, end_day);
+    
+  var s2_sr_cld_col = get_s2_sr_cld_col(aoi, start_date, end_date);
+    
+  var imgColl = s2_sr_cld_col.map(add_cld_shdw_mask)
+        .map(apply_cld_shdw_mask)//Aplica la función almacenada en apply_cld_shdw_mask a cada imagen en la colección.
+        .select(["B2", "B3", "B4", "B8", "B11", "B12"], ['blue', 'green', 'red', 'nir', 'swir1', 'swir2'])//Renombra las bandas.
+        .map(add_ndvi).map(calculateEVI);//Aplica las funciones add_ndvi y calculateEVI que generan bandas NDVI y EVI. 
+
+  var percentile_options = model_inputs['percentileOptions'];// Trae los valores de los percentiles para los que se quieren generar bandas 
+  var percentiles = imgColl.reduce(ee.Reducer.percentile({percentiles: percentile_options}));	//Reduce la colección de imágenes al conjunto de imágenes de percentiles usando las opciones de percentiles especificadas.
+                                                                                              //En este caso genera una banda para el valor del percentil 50 (mediana) de los valores que toma un píxel durante todo el periodo 
+                                                                                              //Puede generar valores para otros percentiles si se agregan en model_inputs['percentileOptions']
+                                                    
+  var stack = ee.Image(percentiles);//Convierte la colección de percentiles en una única imagen.
+  return stack;//La función devuelve la imagen procesada.
+
+}
+   
+
+// Buffer the aoi by 100 m and process the satellite data inside the aoi
+//var region = aoi.buffer(100);
+var assetId = 'pc300-samz-sinchi';// Este probablemente es el ID del recurso o "asset" en Google Earth Engine donde se almacenará la imagen
+var img = s2process(aoi, start_year, end_year);//Ejecuta las funciones definidas dentro de s2process.
+
+img = img.toFloat(); //Convierte los valores de la imagen a números flotantes.
+                     //Útil para realizar operaciones matemáticas en los valores de los píxeles sin perder precisión.
+
+
+var mosaic_img = img.select(['blue_p50', 'green_p50', 'red_p50', 'NDVI_p50', 'EVI_p50']);//Se seleccionan solo las bandas de la imagen deseadas.
+var mosaico_img = mosaic_img.clip(region)         ;                                                                               //El resultado se almacena en mosaic_img.
+print(mosaic_img);//Imprime la información de mosaic_img en la consola de GEE
+var processedCollection = ee.Image(mosaic_img);//Se convierte mosaic_img a una imagen Earth Engine usando ee.Image(). 
+                                                //La imagen resultante se almacena en la variable processedCollection.
+
+var assetId = 'ee-servir-sinchi-lccv';
+var assetId = 'sinchi_temp_assets';
+// Exporta la imagen a un "Asset" the image de Google Earth Engine
+Export.image.toAsset({
+   image: mosaic_img,
+   description: 'comp_colomb_amazon_temp_s1',
+   assetId: assetId,
+   region: region,
+   scale: 10,
+   maxPixels:  1e13
+});
+
+/*
+
+//Visualizing the processed image
+Map.addLayer(mosaic_img.select('NDVI_p50'), {    min: -1,
+max: 1,    palette: ['blue', 'white', 'green'] }, 'Processed NDVI');
+
+Map.centerObject(aoi, 8); // Setting the map center to the defined aoi and zoom level 12
+
+*/
