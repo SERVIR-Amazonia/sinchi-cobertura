@@ -1,1 +1,151 @@
+// Load the shapefile as a feature collection
+var sampling_points_S1 = ee.FeatureCollection('projects/pc300-samz-sinchi/assets/sampling_points/poli_2022_S1_points');
+var sampling_points_S2 = ee.FeatureCollection('projects/pc300-samz-sinchi/assets/sampling_points/poli_2022_S2_points');
+
+/**
+ * Este código genera un mosaico para procesar imágenes Sentinel-2, eliminando nubes y sombras,
+ * y luego calculando NDVI y EVI para las áreas de interés.
+ * El script procesa imágenes de Sentinel-2 del área de la Amazonía Colombiana durante un período específico.
+ * (Ej. Una imagen por semestre)
+ */
+
+/**
+ * Definir variables
+ */
+var module_covariates = require('users/an-sig/sinchi:classification/covariates');			// Función para procesar imágenes Sentinel-2.
+
+ 
+var CLOUD_FILTER = 70;
+var CLD_PRB_THRESH = 40;
+var NIR_DRK_THRESH = 0.15;
+var CLD_PRJ_DIST = 2;
+var BUFFER = 10;
+var SR_BAND_SCALE = 1e4;
+var model_inputs = {
+  'percentileOptions': [50],
+};
+
+var start_year = 2022;
+var start_month = 7;
+var start_day = 1;
+var end_year = 2022;
+var end_month = 12;
+var end_day = 31;
+
+
+var dem = ee.Image('USGS/SRTMGL1_003');
+var demResampled = dem.resample('bicubic');
+
+
+// Función para obtener la colección de imágenes SR y de probabilidad de nubes.
+var get_s2_sr_cld_col = function(region, start_date, end_date) {
+  var s2_sr_col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(region)
+    .filterDate(start_date, end_date)
+    .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', CLOUD_FILTER));
+    
+  var s2_cloudless_col = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
+    .filterBounds(region)
+    .filterDate(start_date, end_date);
+
+  var join = ee.Join.saveFirst('s2cloudless');
+  var filter = ee.Filter.equals({
+    leftField: 'system:index',
+    rightField: 'system:index'
+  });
+    
+  return ee.ImageCollection(join.apply({
+    primary: s2_sr_col,
+    secondary: s2_cloudless_col,
+    condition: filter
+  }));
+};
+
+// Función para agregar bandas de probabilidad de nubes y máscara binaria de nubes.
+var add_cloud_bands = function(img) {
+  var cld_prb = ee.Image(img.get('s2cloudless')).select('probability');
+  var is_cloud = cld_prb.gt(CLD_PRB_THRESH).rename('clouds');
+  
+  return img.addBands(ee.Image([cld_prb, is_cloud]));
+};
+
+// Función para agregar bandas de sombras.
+var add_shadow_bands = function(img) {
+  var not_water = img.select('SCL').neq(6);
+  var dark_pixels = img.select('B8').lt(NIR_DRK_THRESH * SR_BAND_SCALE).multiply(not_water).rename('dark_pixels');
+  var shadow_azimuth = ee.Number(90).subtract(ee.Number(img.get('MEAN_SOLAR_AZIMUTH_ANGLE')));
+  var cld_proj = img.select('clouds').directionalDistanceTransform(shadow_azimuth, CLD_PRJ_DIST * 10)
+    .reproject({
+      crs: img.select(0).projection(),
+      scale: 20
+    })
+    .select('distance')
+    .mask()
+    .rename('cloud_transform');
+    
+  var shadows = cld_proj.multiply(dark_pixels).rename('shadows');
+  
+  return img.addBands(ee.Image([dark_pixels, cld_proj, shadows]));
+};
+
+// Función para agregar una máscara de sombras de nubes como banda.
+var add_cld_shdw_mask = function(img) {
+  var img_cloud = add_cloud_bands(img);
+  var img_cloud_shadow = add_shadow_bands(img_cloud);
+  var is_cld_shdw = img_cloud_shadow.select('clouds').add(img_cloud_shadow.select('shadows')).gt(0);
+  
+  var is_cld_shdw = is_cld_shdw.focal_min(2).focal_max(BUFFER * 2 / 20)
+    .reproject({
+      crs: img.select([0]).projection(),
+      scale: 20
+    })
+    .rename('cloudmask');
+  
+  return img.addBands(is_cld_shdw);
+};
+
+// Función para aplicar la máscara de sombras de nubes a las bandas de reflectancia.
+var apply_cld_shdw_mask = function(img) {
+  var not_cld_shdw = img.select('cloudmask').not();
+  return img.select('B.*').updateMask(not_cld_shdw);
+};
+
+// Función para estimar NDVI y agregarlo como banda.
+var add_ndvi = function(img) {
+  var ndvi = img.normalizedDifference(['nir', 'red']).rename('NDVI');
+  img = img.addBands(ndvi);
+  var covariates = ["blue", "green", "red", "nir", "swir1", 'swir2', 'NDVI'];
+  img = img.select(covariates);
+  return img;
+};
+
+
+// Función para procesar imágenes Sentinel-2.
+exports.s2process = function(region, start_year, end_year, start_month, start_day,end_month, end_day) {
+  var start_date = ee.Date.fromYMD(start_year, start_month, start_day);
+  var end_date = ee.Date.fromYMD(end_year, end_month, end_day);
+    
+  var s2_sr_cld_col = get_s2_sr_cld_col(region, start_date, end_date);
+    
+  var imgColl = s2_sr_cld_col.map(add_cld_shdw_mask)
+    .map(apply_cld_shdw_mask)
+    .select(["B2", "B3", "B4", "B8", "B11", "B12"], ['blue', 'green', 'red', 'nir', 'swir1', 'swir2']);
+   
+  var reducer =50
+    //var reduced_percentile = imgColl .reduce(ee.Reducer.mean());
+    var reduced_percentile = imgColl.reduce(ee.Reducer.percentile([50]));
+    //var composite = ee.ImageCollection(reduced_percentile.collection).toBands()
+    var stack = ee.Image(reduced_percentile);
+   var stack = stack.clip(region);
+   var stack = stack.toFloat(); // Convierte todas las bandas a float
+  return stack;
+  
+};
+
+
+
+// Llamar a la función 
+//var processedImage = s2process(aoi, start_year, end_year, start_month, start_day,end_month, end_day);
+//print("imagen", processedImage)
+
 
