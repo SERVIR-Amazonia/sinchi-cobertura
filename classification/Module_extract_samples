@@ -1,0 +1,119 @@
+var geometry = /* color: #d63000 */ee.Geometry.Polygon(
+        [[[-71.40636212919651, -0.4545955909329242],
+          [-71.36415599236246, -0.45013054834153504],
+          [-71.32606965500655, -0.44497859961377856],
+          [-71.32193136734023, -0.37118095318751787],
+          [-71.4135881996886, -0.37667056564592793]]]),
+    Region_100K = ee.FeatureCollection("projects/pc300-samz-sinchi/assets/Region_100K");
+
+// Load the shapefile as a feature collection
+var sampling_points_S1 = ee.FeatureCollection('projects/pc300-samz-sinchi/assets/sampling_points/poli_2022_S1_points');
+var sampling_points_S2 = ee.FeatureCollection('projects/pc300-samz-sinchi/assets/sampling_points/poli_2022_S2_points');
+
+//Acá vienen puntos que representan un pixel dentro del polígono
+//Este proceso se realizó en R
+
+var numSamplesPerClass=140 //Numero de muestras a seleccionar por clase
+
+// Exponer la geometría y las colecciones de regiones como propiedades del módulo.
+exports.geometry = geometry;
+exports.Region_100K = Region_100K;
+exports.sampling_points_S1 = sampling_points_S1;
+exports.sampling_points_S2 = sampling_points_S2;
+
+// Definir nivel_1 como el atributo a partir del cual se estratificarán las muestras.
+var estratoField = 'nivel_1';
+
+// Obtener una lista de valores únicos en el campo de estrato.
+var estratos_S1 = sampling_points_S1.aggregate_array(estratoField).distinct();
+var estratos_S2 = sampling_points_S2.aggregate_array(estratoField).distinct();
+
+// Inicializar una lista vacía para almacenar las muestras balanceadas de cada semestre
+var muestrasBalanceadas_S1 = ee.List([]);
+var muestrasBalanceadas_S2 = ee.List([]);
+
+// Definir una función para balancear las muestras
+// Exponer la función balanceSamples como un método del módulo.
+function balanceSamples (featureCollection, numSamplesPerClass) {
+  var uniqueClassesList = featureCollection.aggregate_array('nivel_1').distinct();
+  var balancedSamplesPerClass = uniqueClassesList.map(function(classValue) {
+    var classSamples = featureCollection.filter(ee.Filter.eq('nivel_1', classValue));
+    var randomSamples = classSamples.randomColumn('random', 0).sort('random').limit(numSamplesPerClass);
+    return randomSamples;
+  });
+  return ee.FeatureCollection(balancedSamplesPerClass).flatten();
+};
+
+
+function splitAndJoinDataset(data) {
+    // Split the dataset into training and testing sets.
+    var trainingTesting = data.randomColumn();
+    var trainingSet = trainingTesting
+        .filter(ee.Filter.lessThan('random', 0.8));
+    var testingSet = trainingTesting
+        .filter(ee.Filter.greaterThanOrEquals('random', 0.8));
+    
+    // Define a spatial filter for joining datasets within a 1000 meter radius.
+    var distFilter = ee.Filter.withinDistance({
+        distance: 200,  // Set the joining distance to 200 meters.
+        leftField: '.geo',
+        rightField: '.geo',
+        maxError: 10
+    });
+
+    // Apply an inverted spatial join between the training and testing sets.
+    var join = ee.Join.inverted();
+    var spatialJoinedSet = join.apply(trainingSet, testingSet, distFilter);
+
+    // Return the split and spatially joined datasets.
+    return {
+        trainingSet: trainingSet,             // The initial training set before the join.
+        testingSet: testingSet,               // The initial testing set before the join.
+        spatialJoinedSet: spatialJoinedSet    // The result of the inverted spatial join.
+    };
+}
+
+//Balancear muestras para cada clase y generar puntos de entrenamiento y test dentro de cada clase
+//aseegurandose que las muestras de entrenamiento dentro de cada clase 
+//se encuentren separadas por mas de 100 m entre si den
+function balanceAndApplyCorrelation (featureCollection, estratos) {
+  // Usa map para aplicar la correlación a cada estrato y acumula los conjuntos de entrenamiento y prueba
+  var trainingSets = estratos.map(function(estrato) {
+    var estratoData = featureCollection.filter(ee.Filter.eq(estratoField, estrato));
+    var balancedSample = balanceSamples(estratoData, numSamplesPerClass);
+    var correlatedSample = splitAndJoinDataset(balancedSample);
+    return correlatedSample.spatialJoinedSet;
+  });
+
+  var testingSets = estratos.map(function(estrato) {
+    var estratoData = featureCollection.filter(ee.Filter.eq(estratoField, estrato));
+    var balancedSample = balanceSamples(estratoData, numSamplesPerClass);
+    var correlatedSample = splitAndJoinDataset(balancedSample);
+    return correlatedSample.testingSet;
+  });
+
+  // Combina todas las colecciones de muestras en una sola FeatureCollection
+  var combinedTrainingSet = ee.FeatureCollection(trainingSets).flatten();
+  var combinedTestingSet = ee.FeatureCollection(testingSets).flatten();
+
+  return {
+    training: combinedTrainingSet,
+    testing: combinedTestingSet
+  };
+}
+// Y luego exportar funciones
+exports.balanceSamples = balanceSamples;
+exports.splitAndJoinDataset = splitAndJoinDataset;
+exports.balanceAndApplyCorrelation = balanceAndApplyCorrelation;
+
+// Llamar a la función para S1 y S2 y guarda los resultados
+exports.executeAndVisualize = function() {
+  var combinedResults_S1 = balanceAndApplyCorrelation(sampling_points_S1, estratos_S1);
+  var combinedResults_S2 = balanceAndApplyCorrelation(sampling_points_S2, estratos_S2);
+  
+  // En lugar de imprimir directamente, retorna los resultados
+  return {
+    combinedResults_S1: combinedResults_S1,
+    combinedResults_S2: combinedResults_S2
+  };
+};
