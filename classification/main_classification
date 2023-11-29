@@ -1,0 +1,153 @@
+var Region_100K = ee.FeatureCollection("projects/pc300-samz-sinchi/assets/Region_100K");
+var aoi =geometry
+//var aoi = Region_100K.first().geometry();
+var region = aoi.buffer(100);
+//Decalrar variables
+var start_year = 2022;
+var start_month = 7;
+var start_day = 1;
+var end_year = 2022;
+var end_month = 12;
+var end_day = 31;
+
+
+var miModulo = require('users/an-sig/sinchi:classification/Module_extract_samples');
+var moduloComposite= require('users/an-sig/sinchi:classification/composition');
+var moduloCovariates= require('users/an-sig/sinchi:classification/covariates');
+
+// Ejecutar la función y recibe los resultados
+var visualizationResults = miModulo.executeAndVisualize();
+var balanceAndApplyCorrelation=miModulo.balanceAndApplyCorrelation;
+
+
+// Traer puntos de muestreo para semestre 1 
+//Tenemos unafeature collection para muestreos de entrenamiento y validacion
+//el atributo (columna) a traves del cual se hara la cllasificacion es nivel_1
+var S1_training=visualizationResults.combinedResults_S1.training;
+var S1_testing=visualizationResults.combinedResults_S1.testing;
+
+
+var processedImage = moduloComposite.s2process(region, start_year, end_year, start_month, start_day,end_month, end_day);
+print("processedImage",processedImage);
+
+
+var image_covariates=moduloCovariates.returnCovariates(processedImage);
+var image_covariates=image_covariates.clip(region);
+
+print("image_covariates2",image_covariates);
+
+var bandInfo = processedImage.bandTypes();print('Band Information:', bandInfo);
+print("imagen", processedImage)
+var visualizationParams = {  "bands": ["swir1_p50", "nir_p50", "swir2_p50"],
+  "min": [200, 200,200],
+  "max": [5000,5000,50000],
+  "gamma": 0.5,
+}; // Ajusta según tus bandas
+
+
+Map.addLayer(processedImage,visualizationParams,'processedImage');
+
+
+// Correr RF
+function RFprim(trainingPts, inputImage) {
+    var trainingData = inputImage.sampleRegions({
+        collection: trainingPts,
+        properties: ['nivel_1'],
+        scale: 30
+    });
+
+    var classifier = ee.Classifier.smileRandomForest(100).train({
+        features: trainingData,
+        classProperty: 'nivel_1',
+        inputProperties: inputImage.bandNames()
+    });
+
+    return inputImage.classify(classifier);
+}
+
+
+// Entrenar el clasificador con los puntos de entrenamiento
+var classifiedImage = RFprim(S1_training, processedImage);
+//var classifiedImage  = classifiedImage .multiply(255).toByte();
+
+print("classifiedImage ",classifiedImage )
+
+// Mostrar los resultados
+//print("combinedResults_S1.training", visualizationResults.combinedResults_S1.training);
+//print("combinedResults_S1.testing", visualizationResults.combinedResults_S1.testing);
+//print("combinedResults_S2.training", visualizationResults.combinedResults_S2.training);
+//print("combinedResults_S2.testing", visualizationResults.combinedResults_S2.testing);
+
+// Agregar las capas de los puntos de muestreo al mapa
+Map.addLayer(visualizationResults.combinedResults_S1.training, {color: 'blue'}, 'Training Points S1');
+//Map.addLayer(visualizationResults.combinedResults_S1.testing, {color: 'red'}, 'Testing Points S1');
+//Map.addLayer(visualizationResults.combinedResults_S2.training, {color: 'green'}, 'Training Points S2');
+//Map.addLayer(visualizationResults.combinedResults_S2.testing, {color: 'yellow'}, 'Testing Points S2');
+
+// Centrar el mapa en uno de los conjuntos de puntos
+Map.centerObject(visualizationResults.combinedResults_S1.training);
+var exportParams = {
+  image: classifiedImage,
+  description: 'classified_image_export',
+  fileNamePrefix: 'classified_image',
+  scale: 32,  // Debe coincidir con la resolución utilizada para el análisis
+  region: region,  // Especifica la región que deseas exportar
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13  // Ajusta según las necesidades
+};
+Export.image.toDrive(exportParams);
+
+// Mostrar imagen clasificada en mapa:
+// Suponiendo que classifiedImage es tu imagen de clasificación
+
+// Definir la paleta de colores y nombres de clases
+var palette = ['red', 'green', 'blue', 'yellow', 'purple']; // Colores
+var classNames = ['Territorios Artificializados', 'Terriotrios Agrícolas',
+'Bosques y áreas seminaturales', 'Areas húmedas', 'Superficies de agua']; // Nombres
+
+// Parámetros de visualización para la imagen
+var visualizationParams = {
+  min: 1,
+  max: 5,
+  palette: palette
+};
+
+// Agregar la imagen al mapa
+Map.addLayer(classifiedImage, visualizationParams, 'Imagen Clasificada');
+// Crear un panel para la leyenda
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px'
+  }
+});
+
+// Agregar título a la leyenda
+var legendTitle = ui.Label({
+  value: 'Leyenda',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '16px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+legend.add(legendTitle);
+
+// Agregar las entradas de la leyenda
+classNames.forEach(function(name, index){
+  var color = palette[index];
+  var label = ui.Label({
+    value: name,
+    style: {
+      color: 'black',
+      backgroundColor: color,
+      margin: '2px',
+      padding: '2px'
+    }
+  });
+  legend.add(label);
+});
+
+// Agregar la leyenda al mapa
+Map.add(legend);
