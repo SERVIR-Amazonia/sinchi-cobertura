@@ -1,23 +1,26 @@
 var Region_100K = ee.FeatureCollection("projects/pc300-samz-sinchi/assets/Region_100K");
-var aoi =geometry
-//var aoi = Region_100K.first().geometry();
+
+var aoi = Region_100K.first().geometry();
 var region = aoi.buffer(100);
+var region=geometry;
+var geometry = region;
 //Decalrar variables
 var start_year = 2022;
-var start_month = 7;
+var start_month = 1;
 var start_day = 1;
 var end_year = 2022;
-var end_month = 12;
+var end_month = 7;
 var end_day = 31;
 
-
-var miModulo = require('users/an-sig/sinchi:classification/Module_extract_samples');
+var module_extract_samples = require('users/an-sig/sinchi:classification/module_extract_samples');
 var moduloComposite= require('users/an-sig/sinchi:classification/composition');
 var moduloCovariates= require('users/an-sig/sinchi:classification/covariates');
-
+var modulo_classifier=require('users/an-sig/sinchi:classification/classify');
+var clase ='nivel_1'
 // Ejecutar la función y recibe los resultados
-var visualizationResults = miModulo.executeAndVisualize();
-var balanceAndApplyCorrelation=miModulo.balanceAndApplyCorrelation;
+var visualizationResults = module_extract_samples.executeAndVisualize();
+var balanceAndApplyCorrelation=module_extract_samples.balanceAndApplyCorrelation;
+
 
 
 // Traer puntos de muestreo para semestre 1 
@@ -26,52 +29,305 @@ var balanceAndApplyCorrelation=miModulo.balanceAndApplyCorrelation;
 var S1_training=visualizationResults.combinedResults_S1.training;
 var S1_testing=visualizationResults.combinedResults_S1.testing;
 
-
+print("S1_testing 32",S1_testing)
 var processedImage = moduloComposite.s2process(region, start_year, end_year, start_month, start_day,end_month, end_day);
-print("processedImage",processedImage);
 
 
-var image_covariates=moduloCovariates.returnCovariates(processedImage);
+var image_covariates=moduloCovariates.returnCovariates(processedImage,geometry);
 var image_covariates=image_covariates.clip(region);
+
+
+
+var imageGeometry = image_covariates.geometry();
+
+// Filtrar el FeatureCollection para conservar solo los puntos dentro del extent de la imagen
+var S1_training = S1_training.filterBounds(imageGeometry);
+
+
 
 print("image_covariates2",image_covariates);
 
 var bandInfo = processedImage.bandTypes();print('Band Information:', bandInfo);
-print("imagen", processedImage)
+
 var visualizationParams = {  "bands": ["swir1_p50", "nir_p50", "swir2_p50"],
   "min": [200, 200,200],
   "max": [5000,5000,50000],
   "gamma": 0.5,
-}; // Ajusta según tus bandas
+  
+}; // Ajusta según  bandas
 
 
-Map.addLayer(processedImage,visualizationParams,'processedImage');
+//primitives
+
+//convert nivel_1 a string
 
 
-// Correr RF
-function RFprim(trainingPts, inputImage) {
-    var trainingData = inputImage.sampleRegions({
-        collection: trainingPts,
+// Función para convertir la propiedad 'nivel_1' de entero a string
+var convertNivel1ToString = function(feature) {
+    // Obtener el valor actual de 'nivel_1' y convertirlo a string
+    var nivel1String = ee.Number(feature.get('nivel_1')).format();
+
+    // Establecer el valor convertido de vuelta en la propiedad 'nivel_1'
+    return feature.set('nivel_1', nivel1String);
+};
+
+// Aplicar la función a cada Feature en el FeatureCollection
+var trainingDataUpdated = S1_training.map(convertNivel1ToString);
+var trainingDataUpdated = image_covariates.sampleRegions({
+        collection: trainingDataUpdated,
         properties: ['nivel_1'],
-        scale: 30
+        scale: 20
     });
 
-    var classifier = ee.Classifier.smileRandomForest(100).train({
-        features: trainingData,
-        classProperty: 'nivel_1',
-        inputProperties: inputImage.bandNames()
-    });
+print("trainingDataUpdated 83",trainingDataUpdated);
+var testingDataUpdated = S1_testing.map(convertNivel1ToString);
 
-    return inputImage.classify(classifier);
+
+//var RFprim_class_funct=modulo_classifier.RFprim_class(S1_training, inputStack, clase)
+
+
+var formatPts=function (pts,clase) {
+    // Turn a FC of training points containing full LC typology into a list of primitive point FCs, 
+    // one point FC for each LC primitive
+
+    // Create sets of binary training pts for each class represented in the full training pts collection
+   //var labels = ee.FeatureCollection(pts).aggregate_array(clase.toString()).distinct().sort();
+   var labels = ee.FeatureCollection(pts).aggregate_array(clase).distinct().sort();
+   print("labels83",labels)
+    function binaryPts(l) {
+        // Create prim and non prim sets with filters, reset prim to 1, non-prim to 0
+        var prim = pts.filter(ee.Filter.eq(clase, l)).map(function(f) {
+            return f.set('PRIM', 1);
+        });
+        var nonPrim = pts.filter(ee.Filter.neq(clase, l)).map(function(f) {
+            return f.set('PRIM', 0);
+        });
+        return ee.FeatureCollection(prim).merge(nonPrim);
+    }
+
+    var listOfPrimPts = ee.List(labels).map(binaryPts);
+    //var listOfPrimPts = ee.List(labels).map(binaryPts);
+    print("listOfPrimPts L 93_main",listOfPrimPts)
+    
+    return listOfPrimPts;
+};
+
+
+
+var getTop20=function (dict) {
+    // If total input features count < 20, take them all, otherwise take top 20 most important
+    dict = ee.Dictionary(dict);
+    var values = dict.values().sort();
+    //print("values 107",values)
+    var cutoff = ee.Algorithms.If(values.size().gte(20), -20, values.size().multiply(-1));
+    
+    function kvReturn(key, passedObj) {
+        passedObj = ee.List(passedObj);
+        var val = ee.Number(dict.get(key));
+        var retObj = ee.Algorithms.If(val.gte(cutoff), passedObj.add(key), passedObj);
+        return retObj;
+    }
+
+    var newList = dict.keys().iterate(kvReturn, ee.List([]));
+    //print("newList 130",newList)
+    return newList;
 }
 
 
-// Entrenar el clasificador con los puntos de entrenamiento
-var classifiedImage = RFprim(S1_training, processedImage);
+// Función para verificar y manejar propiedades faltantes
+function checkAndHandleMissingProperties(feature) {
+    var requiredProperties = ['blue', 'green', 'red']; // y otras propiedades relevantes
+    var defaultValue = 0; // Define un valor por defecto adecuado
+
+    requiredProperties.forEach(function(prop) {
+        // Crear una condición que verifique si la propiedad existe
+        var condition = feature.propertyNames().contains(prop);
+
+        // Usar 'ee.Algorithms.If' para manejar la propiedad faltante
+        feature = ee.Feature(ee.Algorithms.If(condition, feature, feature.set(prop, defaultValue)));
+    });
+
+    return feature;
+}
+
+
+var RFprim=function (trainingPts,inputStack, label) {
+    // Train and apply RF Probability classifier on a Primitive
+    var inputs = ee.Image(inputStack);
+    print("line 121 trainingPts",trainingPts)
+    var samples = ee.FeatureCollection(trainingPts);
+    print("samples",samples);
+    // Aplicar esta función a todas las características en la colección
+    samples = samples.map(checkAndHandleMissingProperties);
+    var linea160=samples.sort('PRIM', false)
+    print( linea160,"linea 161");
+    var linea125=linea160.first();
+    print("primeros features linea163",linea125)
+
+    //var classValue = ee.Number(ee.Feature(samples.sort('PRIM', false).first()).get(clase));
+
+    // Can experiment with classifier params for model performance
+    var classifier = ee.Classifier.smileRandomForest({
+        numberOfTrees: 100,
+        minLeafPopulation: 1,
+        bagFraction: 0.7,
+        seed: 51515
+    }).setOutputMode('PROBABILITY');
+
+    // Train model with all features
+    var model = classifier.train({
+        features: samples,
+        classProperty: 'PRIM',
+        inputProperties: inputs.bandNames()
+    });
+    
+    // Store for model performance exploration
+    var explain=model.explain();
+    print("explain 190",explain);
+    var oobAll = ee.Dictionary(model.explain()).get('outOfBagErrorEstimate')
+    var importanceAll = ee.Dictionary(model.explain()).get('importance');
+    print("importanceAll 188",importanceAll);
+
+    // Retrieve top 20 most important features
+    var top20 = getTop20(importanceAll); // Ensure getTop20 function is defined in your script
+    
+    // Re-train model with top 20 important features
+    model = classifier.train({
+        features: samples,
+        classProperty: 'PRIM',
+        inputProperties: top20
+    });
+    print("model 200",model);
+
+    var oobTop20 = ee.Dictionary(model.explain()).get('outOfBagErrorEstimate');
+    var importanceTop20 = ee.Dictionary(model.explain()).get('importance');
+    var schema = ee.List(ee.Classifier(model).schema());
+    var output = inputs.classify(model, 'Probability')
+                    .set({
+                        'Primitive': 'nivel_1',
+                        'importance': importanceTop20,
+                        'schema': schema,
+                        'model': model,
+                        'oobError': oobTop20
+                    });
+    print("output 213",output);
+    return output;
+};
+
+var createLCPrimitiveCollection=function(inputStack, trainingPts, label) {
+    /*
+    Create LC Primitive image for each LC class in training points.
+
+    args:
+        inputStack (ee.Image): of all covariates and predictor
+        trainingPts (ee.FeatureCollection): training pts containing full LC typology
+        className (str): property name in training points containing model classes
+    
+    returns:
+        An object containing the ImageCollection, region, and training data
+    */   
+  
+  
+    inputStack = ee.Image(inputStack);
+    print('Type of inputStack:', inputStack);
+    trainingPts = ee.FeatureCollection(trainingPts);
+
+    // list of distinct LANDCOVER values
+    var labels = trainingPts.aggregate_array(clase).distinct().sort();
+
+
+     var primList = ee.List([]);
+ labels.getInfo().forEach(function(label) {
+        var labelIndex = ee.Number.parse(label).subtract(1).toInt(); // Convertir la etiqueta a índice
+        var formattedPtsList = formatPts(trainingPts, clase);
+
+        var primPts = ee.FeatureCollection(formattedPtsList.get(labelIndex)); // Usar el índice para obtener los puntos
+        print("primPts 245",primPts);
+        var img = RFprim(primPts, inputStack, label);
+        primList = primList.add(img);
+    });
+    print("primList 251",primList)
+    return ee.ImageCollection.fromImages(primList);
+};
+
+var primitives=createLCPrimitiveCollection(image_covariates, trainingDataUpdated, clase) ;
+
+// Asegúrate de que 'primitives' es una ImageCollection
+var firstPrimitiveImage = primitives.first();
+print("firstPrimitiveImage 258",firstPrimitiveImage)
+
+// Definir los parámetros de visualización para la imagen
+// Nota: Debes ajustar estos parámetros según las bandas y características de tu imagen
+
+
+var probabilityBand = firstPrimitiveImage.select('probability')
+
+// Define los parámetros de visualización
+var visParams = {'min': 0, 'max': 1, 'palette': ['blue', 'green', 'red']}  
+// Añade la banda al mapa
+
+//Map.addLayer(probabilityBand, visParams, 'Probability Band')
+//mostrar en mapa primeara imagen
+
+var primitivesList = primitives.toList(primitives.size());
+
+// Iterar sobre la lista de imágenes
+for (var i = 0; i < primitivesList.size().getInfo(); i++) {
+    var image = ee.Image(primitivesList.get(i));
+    
+    // Define los parámetros de exportación
+    var exportParams = {
+        'image': image,
+        'description': 'nombre_de_exportacion_' + i, // Añade un nombre único para cada exportación
+        'assetId': 'projects/pc300-samz-sinchi/assets/image_' + i, // Reemplaza con tu ruta de asset
+        'scale': 500, // Ajusta la escala según tus datos
+        'region': region // O define una región específica
+    };
+
+    // Exporta la imagen
+    Export.image.toAsset(exportParams);
+}
+// Agregar la primera imagen de la colección al mapa
+
+// Opcional: Centrar el mapa en la ubicación de la imagen
+Map.centerObject(processedImage);
+//var listOfPrimPts = formatPts(trainingDataUpdated,clase)
+
+/* Verificar primeros features in the list of feature collectiosn
+// Printing a few features from each FeatureCollection in the list
+// Get the first FeatureCollection from the list
+var firstFeatureCollection = ee.FeatureCollection(primitivos_funct.get(0));
+
+// Print the first three features of this FeatureCollection
+var firstThreeFeatures = firstFeatureCollection.limit(3);
+print('First three features of the first FeatureCollection:', firstThreeFeatures);
+*/
+
+Map.addLayer(processedImage,visualizationParams,'processedImage');
+/////////////////
+/*test simple classifier
+
+var classify = modulo_classifier.rf(S1_training, S1_testing,image_covariates);
 //var classifiedImage  = classifiedImage .multiply(255).toByte();
 
-print("classifiedImage ",classifiedImage )
+//var classified_image_S1=classify.classified_image;
+var classifier_S1=classify.rfclassifier;
+var trainingData_S1=classify.testingData;
+var testingData_S1=classify.testingData;
 
+/////////////////
+
+var confusion_matrix = modulo_classifier.calculateConfusionMatrix(testingData_S1,classifier_S1);
+
+var importance =modulo_classifier.importance(classifier_S1)
+print("importance",importance)
+
+
+
+//print("classified_image_S1  ",classified_image_S1  );
+*/
+//////
+/*
 // Mostrar los resultados
 //print("combinedResults_S1.training", visualizationResults.combinedResults_S1.training);
 //print("combinedResults_S1.testing", visualizationResults.combinedResults_S1.testing);
@@ -79,8 +335,8 @@ print("classifiedImage ",classifiedImage )
 //print("combinedResults_S2.testing", visualizationResults.combinedResults_S2.testing);
 
 // Agregar las capas de los puntos de muestreo al mapa
-Map.addLayer(visualizationResults.combinedResults_S1.training, {color: 'blue'}, 'Training Points S1');
-//Map.addLayer(visualizationResults.combinedResults_S1.testing, {color: 'red'}, 'Testing Points S1');
+//Map.addLayer(visualizationResults.combinedResults_S1.training, {color: 'blue'}, 'Training Points S1');
+Map.addLayer(visualizationResults.combinedResults_S1.testing, {color: 'red'}, 'Testing Points S1');
 //Map.addLayer(visualizationResults.combinedResults_S2.training, {color: 'green'}, 'Training Points S2');
 //Map.addLayer(visualizationResults.combinedResults_S2.testing, {color: 'yellow'}, 'Testing Points S2');
 
@@ -113,7 +369,7 @@ var visualizationParams = {
 };
 
 // Agregar la imagen al mapa
-Map.addLayer(classifiedImage, visualizationParams, 'Imagen Clasificada');
+//Map.addLayer(classifiedImage, visualizationParams, 'Imagen Clasificada');
 // Crear un panel para la leyenda
 var legend = ui.Panel({
   style: {
@@ -151,3 +407,5 @@ classNames.forEach(function(name, index){
 
 // Agregar la leyenda al mapa
 Map.add(legend);
+
+*/
